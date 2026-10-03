@@ -1,0 +1,504 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<title>AR Blok Pinch 6DoF</title>
+<style>
+*{box-sizing:border-box;margin:0;-webkit-tap-highlight-color:transparent}
+html,body{height:100%;background:#000;overflow:hidden;font-family:system-ui,sans-serif;color:#fff;touch-action:none}
+#cam,#gl,#hud{position:fixed;inset:0;width:100%;height:100%}
+#cam{object-fit:cover}
+#hud{pointer-events:none}
+#bar{position:fixed;left:0;right:0;bottom:calc(14px + env(safe-area-inset-bottom));display:flex;gap:10px;justify-content:center;z-index:5}
+#bar button{background:rgba(20,30,255,.85);border:0;color:#fff;padding:12px 18px;border-radius:14px;font-size:15px;font-weight:600}
+#pal{position:fixed;left:0;right:0;bottom:calc(66px + env(safe-area-inset-bottom));display:none;gap:6px;justify-content:center;z-index:5;padding:0 8px}
+#pal button{background:rgba(10,12,30,.7);border:2px solid transparent;color:#fff;border-radius:12px;padding:6px 8px;font-size:11px;display:flex;flex-direction:column;align-items:center;gap:3px;min-width:48px}
+#pal button.on{border-color:#fff}
+#pal i{width:18px;height:18px;border-radius:5px;display:block;border:2px solid #1a2cff}
+#bar button.on{background:#0a8f3c}
+#info{position:fixed;top:calc(10px + env(safe-area-inset-top));left:0;right:0;text-align:center;font-size:13px;opacity:.85;z-index:5;text-shadow:0 1px 3px #000}
+#start{position:fixed;inset:0;background:#05060d;z-index:10;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:16px;padding:28px;text-align:center}
+#start h1{font-size:26px}
+#start p{opacity:.75;font-size:14px;max-width:320px;line-height:1.5}
+#go{background:#1a2cff;color:#fff;border:0;padding:14px 34px;border-radius:16px;font-size:17px;font-weight:700}
+</style>
+</head>
+<body>
+<video id="cam" playsinline muted autoplay></video>
+<canvas id="gl"></canvas>
+<canvas id="hud"></canvas>
+<div id="info">Memuat…</div>
+<div id="pal">
+  <button data-t="auto"><i style="background:linear-gradient(135deg,#e5392f,#9fd8ff,#ffd23a)"></i>Auto</button>
+  <button data-t="blok" class="on"><i style="background:#909eb9"></i>Blok</button>
+  <button data-t="merah"><i style="background:#e5392f"></i>Body</button>
+  <button data-t="kaca"><i style="background:#9fd8ff"></i>Kaca</button>
+  <button data-t="lampu"><i style="background:#ffd23a"></i>Lampu</button>
+  <button data-t="roda"><i style="background:#2a2a30;border-radius:50%"></i>Roda</button>
+</div>
+<div id="bar" style="display:none">
+  <button id="undo">Undo</button>
+  <button id="clear">Hapus</button>
+  <button id="guide">Panduan Mobil</button>
+  <button id="flip" style="display:none">Balik Kamera</button>
+</div>
+<div id="start">
+  <h1>AR Blok Pinch</h1>
+  <p>Cubit (jempol + telunjuk) lalu tarik di udara untuk memanjangkan blok. Lepas cubitan untuk menempatkan. Cubit di dekat blok mana pun lalu tarik untuk bercabang atau membelok; cubit sekali di ruang kosong untuk menaruh satu blok. Pilih bagian (blok/roda/kaca) di bawah, atau nyalakan Panduan Mobil untuk menyusun mobil mainan. Di desktop: tahan klik mouse.</p>
+  <button id="go">Mulai (mode biasa)</button>
+  <button id="goXR" style="background:#0a8f3c;color:#fff;border:0;padding:14px 26px;border-radius:16px;font-size:16px;font-weight:700">Mulai AR 6DoF (Android Chrome)</button>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/hands.js"></script>
+<script>
+const $=id=>document.getElementById(id);
+const video=$('cam'),glc=$('gl'),hud=$('hud'),hx=hud.getContext('2d'),info=$('info');
+const CELL=0.06, FOV=60, HAND_M=0.09;
+let W=innerWidth,H=innerHeight;
+let XR=false,xrSess=null,xrBind=null,flipY=1;
+
+/* ---------- Three ---------- */
+const renderer=new THREE.WebGLRenderer({canvas:glc,alpha:true,antialias:true,powerPreference:'high-performance'});
+renderer.setPixelRatio(Math.min(devicePixelRatio,1.5));
+const scene=new THREE.Scene();
+const camera=new THREE.PerspectiveCamera(FOV,1,0.01,50);
+scene.add(new THREE.AmbientLight(0xffffff,.75));
+const dl=new THREE.DirectionalLight(0xffffff,.6);dl.position.set(.4,1,.6);scene.add(dl);
+
+function mkTex(fill,edge){
+  const c=document.createElement('canvas');c.width=c.height=128;const g=c.getContext('2d');
+  g.fillStyle=edge;g.fillRect(0,0,128,128);g.fillStyle=fill;g.fillRect(12,12,104,104);
+  const t=new THREE.CanvasTexture(c);t.anisotropy=4;return t;
+}
+const geo=new THREE.BoxGeometry(CELL,CELL,CELL);
+const matSolid=new THREE.MeshLambertMaterial({map:mkTex('#909eb9','#1a2cff')});
+const matPrev=new THREE.MeshBasicMaterial({map:mkTex('#2233ff','#3a4cff'),transparent:true,opacity:.6,depthWrite:false});
+
+const matPrevBody=new THREE.MeshBasicMaterial({map:mkTex('#1c2cff','#7b8dff'),transparent:true,opacity:.86,side:THREE.DoubleSide,depthWrite:false});
+const headTex=(()=>{const c=document.createElement('canvas');c.width=c.height=128;const g=c.getContext('2d');
+  g.strokeStyle='#2236ff';g.lineWidth=20;g.strokeRect(0,0,128,128);return new THREE.CanvasTexture(c)})();
+const matHead=new THREE.MeshBasicMaterial({map:headTex,transparent:true,side:THREE.DoubleSide,depthWrite:false});
+const wheelGeo=new THREE.CylinderGeometry(CELL*.5,CELL*.5,CELL*.92,24);wheelGeo.rotateZ(Math.PI/2);
+const MAT={blok:matSolid,
+  merah:new THREE.MeshLambertMaterial({map:mkTex('#e5392f','#7a0f0a')}),
+  kaca:new THREE.MeshLambertMaterial({map:mkTex('#9fd8ff','#1a6fb0')}),
+  lampu:new THREE.MeshBasicMaterial({map:mkTex('#ffe27a','#c98a00')}),
+  roda:new THREE.MeshLambertMaterial({color:0x2a2a30})};
+const built=new THREE.Group(),prev=new THREE.Group();scene.add(built,prev);
+const types=new Map(),cells=new Map();      // key -> mesh
+const history=[];           // array of arrays of keys
+let tail=null;              // [x,y,z]
+
+const key=c=>c.join(','),
+      toWorld=c=>new THREE.Vector3(c[0]*CELL,c[1]*CELL,c[2]*CELL),
+      toGrid=v=>[Math.round(v.x/CELL),Math.round(v.y/CELL),Math.round(v.z/CELL)];
+
+const pops=[];
+function addCell(c,delay=0,type='blok'){
+  const k=key(c);if(cells.has(k))return null;
+  const m=new THREE.Mesh(type==='roda'?wheelGeo:geo,MAT[type]||matSolid);types.set(k,type);m.position.copy(toWorld(c));m.scale.setScalar(.88);
+  built.add(m);cells.set(k,m);pops.push({m,t0:performance.now()+delay});return k;
+}
+function stepPops(now){
+  for(let i=pops.length-1;i>=0;i--){
+    const p=pops[i],u=Math.min(Math.max((now-p.t0)/180,0),1),e=1-Math.pow(1-u,3),o=1+.12*Math.sin(u*Math.PI);
+    p.m.scale.setScalar(.88+.12*e+.05*Math.sin(u*Math.PI));
+    if(u>=1){p.m.scale.setScalar(1);pops.splice(i,1)}
+  }
+}
+function commit(list){
+  const ks=[];list.forEach((c,i)=>{const k=addCell(c,i*5,typeFor(c));if(k)ks.push(k)});
+  if(ks.length)history.push(ks);updateBp();
+  if(list.length)tail=list[list.length-1];
+}
+function undo(){
+  const ks=history.pop();if(!ks)return;
+  ks.forEach(k=>{built.remove(cells.get(k));cells.delete(k);types.delete(k)});
+  const last=history[history.length-1];
+  tail=last?last[last.length-1].split(',').map(Number):null;updateBp();
+}
+$('undo').onclick=undo;
+function placeStart(){
+  if(bpOn||cells.size)return;
+  const f=new THREE.Vector3(0,0,-1).applyQuaternion(camera.quaternion).multiplyScalar(.5).add(camera.position);
+  commit([toGrid(f)]);
+}
+$('clear').onclick=()=>{while(history.length)undo();tail=null};
+
+const pool=[];let prevKey='',headM=null;
+const pv={on:false,ax:0,dir:1,n:0,disp:0,origin:[0,0,0],incl:false};
+function animPrev(dt){
+  if(!pv.on||!drawing)return;
+  pv.disp+=(pv.n-pv.disp)*(1-Math.exp(-dt/.09));
+  if(Math.abs(pv.n-pv.disp)<.003)pv.disp=pv.n;
+  const L=pv.disp,N=Math.ceil(L-1e-3);
+  prev.clear();
+  const base=toWorld(pv.origin),step=CELL*pv.dir;
+  if(pv.incl&&N>0){const o=pool[0]||(pool[0]=new THREE.Mesh(geo,matPrevBody));o.scale.set(1.01,1.01,1.01);o.renderOrder=1;o.position.copy(base);prev.add(o)}
+  if(pv.incl&&N===0){const h=headM||(headM=new THREE.Mesh(geo,matHead));h.scale.setScalar(1.04);h.renderOrder=2;h.position.copy(base);prev.add(h)}
+  for(let i=1;i<=N;i++){
+    const f=Math.min(1,L-(i-1)),head=i===N;
+    const m=head?(headM||(headM=new THREE.Mesh(geo,matHead))):(pool[i]||(pool[i]=new THREE.Mesh(geo,matPrevBody)));
+    m.renderOrder=head?2:1;
+    m.scale.set(1.01,1.01,1.01);m.scale.setComponent(pv.ax,Math.max(f,.02));
+    m.position.copy(base);m.position.setComponent(pv.ax,base.getComponent(pv.ax)+step*((i-.5)+f/2));
+    prev.add(m);
+  }
+}
+function showPrev(list){
+  const k=list.map(key).join('|');
+  if(k===prevKey&&prev.children.length)return;
+  prevKey=k;prev.clear();
+  list.forEach((c,i)=>{
+    const head=i===list.length-1;
+    const m=head?(headM||(headM=new THREE.Mesh(geo,matHead))):(pool[i]||(pool[i]=new THREE.Mesh(geo,matPrevBody)));
+    m.scale.setScalar(head?1.04:1);m.renderOrder=head?2:1;m.position.copy(toWorld(c));prev.add(m);
+  });
+}
+
+/* ---------- Drawing state ---------- */
+let drawing=false,start=null,segs=[],curSeg=[],lastG=null,axLock=null;
+let p0=null,lenN=0,origin=[0,0,0],incl=false;
+function snapH(v){
+  const f=[v.x/CELL,v.y/CELL,v.z/CELL];
+  if(!lastG)lastG=f.map(Math.round);
+  for(let i=0;i<3;i++)if(Math.abs(f[i]-lastG[i])>.65)lastG[i]=Math.round(f[i]);
+  return lastG.slice();
+}
+function seg(a,b){ // sumbu dominan a->b
+  const d=[b[0]-a[0],b[1]-a[1],b[2]-a[2]],ab=d.map(Math.abs);
+  const ax=ab.indexOf(Math.max(...ab)),n=d[ax],dir=Math.sign(n)||1,out=[];
+  for(let i=0;i<=Math.abs(n);i++){const c=a.slice();c[ax]+=i*dir;out.push(c)}
+  const off=ab.filter((_,i)=>i!==ax);
+  return {cells:out,off:Math.max(...off),end:out[out.length-1]};
+}
+let tDown=0;
+function snapCell(p){ // sambung ke blok terdekat; ujung terakhir diutamakan
+  let best=null,bd=1.8;const f=[p.x/CELL,p.y/CELL,p.z/CELL];
+  cells.forEach((m,k)=>{const c=k.split(',').map(Number);
+    let d=Math.hypot(c[0]-f[0],c[1]-f[1],c[2]-f[2]);
+    if(tail&&c[0]===tail[0]&&c[1]===tail[1]&&c[2]===tail[2])d-=.8;
+    if(d<bd){bd=d;best=c}});
+  return best;
+}
+function beginDraw(p){
+  drawing=true;segs=[];tDown=performance.now();
+  let g=toGrid(p);const ng=nearBp(g);if(ng)g=ng;
+  const sn=bpOn?null:snapCell(p);
+  start=sn||g;curSeg=[];lastG=g.slice();axLock=null;
+  p0=p.clone();lenN=0;origin=(sn||g).slice();incl=!sn;
+}
+function chainDraw(p){
+  const d=p.clone().sub(toWorld(origin));{const q=camera.quaternion,iq=q.clone().invert();d.applyQuaternion(iq);d.z*=.55;d.applyQuaternion(q)}
+  const a=[Math.abs(d.x),Math.abs(d.y),Math.abs(d.z)];
+  let ax=a.indexOf(Math.max(...a));
+  if(a[ax]<CELL*.6){axLock=null;ax=-1}
+  else if(axLock!==null&&a[axLock]*1.35>=a[ax])ax=axLock;else axLock=ax;
+  let n=0,dir=pv.dir;
+  if(ax>=0){
+    const f=a[ax]/CELL;
+    if(ax!==pv.ax)lenN=Math.round(f);
+    else if(Math.abs(f-lenN)>.72)lenN=Math.round(f);
+    n=Math.min(lenN,30);dir=Math.sign(d.getComponent(ax))||1;
+  }else lenN=0;
+  const out=[];
+  if(n>0){
+    if(incl)out.push(origin.slice());
+    for(let i=1;i<=n;i++){const c=origin.slice();c[ax]+=i*dir;out.push(c)}
+  }
+  segs=[];curSeg=out;
+  if(ax>=0&&(!pv.on||pv.ax!==ax||pv.dir!==dir))pv.disp=0;
+  pv.on=true;if(ax>=0){pv.ax=ax;pv.dir=dir}
+  pv.n=n;pv.origin=origin.slice();pv.incl=incl;
+}
+function updateDraw(p){
+  if(!drawing)return;
+  if(!bpOn){chainDraw(p);return}
+  const g=snapH(p);let s=seg(start,g);
+  if(s.off>=2&&s.cells.length>1){ // belok: kunci segmen, mulai dari ujung
+    segs.push(s.cells);start=s.end;s=seg(start,g);
+  }
+  curSeg=s.cells;
+  showPrev([...segs.flat(),...curSeg]);
+}
+function endDraw(){
+  if(!drawing)return;drawing=false;
+  if(!bpOn&&incl&&!curSeg.length&&!segs.length&&performance.now()-tDown>120)curSeg=[origin.slice()];
+  const all=[...segs,curSeg];
+  const flat=all.flat().filter((c,i,a)=>a.findIndex(x=>key(x)===key(c))===i);
+  const fresh=flat.filter(c=>!cells.has(key(c)));
+  if(fresh.length)commit(flat.filter(c=>!cells.has(key(c))));
+  prev.clear();segs=[];curSeg=[];pv.on=false;pv.disp=0;
+}
+
+/* ---------- Mobil mainan: panduan ---------- */
+const CARBP=(()=>{
+  const m=new Map(),a=(x,y,z,t)=>m.set(x+','+y+','+z,[x,y,z,t]);
+  for(let x=0;x<3;x++)for(let z=0;z<7;z++){a(x,0,z,'blok');a(x,1,z,'merah')}
+  a(0,1,6,'lampu');a(2,1,6,'lampu');
+  for(let x=0;x<3;x++){a(x,2,2,'kaca');a(x,2,4,'kaca')}
+  a(0,2,3,'kaca');a(2,2,3,'kaca');
+  for(let x=0;x<3;x++)for(let z=2;z<=4;z++)a(x,3,z,'merah');
+  [[-1,1],[3,1],[-1,4],[3,4]].forEach(([x,z])=>a(x,0,z,'roda'));
+  return [...m.values()];
+})();
+const ghost=new THREE.Group();ghost.visible=false;scene.add(ghost);
+let bpOn=false,bpOrg=[0,0,0],curType='blok';
+const bp=new Map(),ghostMeshes=new Map();
+const EG=new THREE.EdgesGeometry(new THREE.BoxGeometry(CELL*.96,CELL*.96,CELL*.96));
+const GCOL={blok:0xdfe4ff,merah:0xff5a4d,kaca:0x8fd8ff,lampu:0xffd23a,roda:0xb0b0c0};
+function typeFor(c){return curType==='auto'?((bp.get(key(c))||{}).t||'blok'):curType}
+function buildGhost(){
+  ghost.clear();bp.clear();ghostMeshes.clear();
+  CARBP.forEach(([x,y,z,t])=>{
+    const c=[bpOrg[0]+x,bpOrg[1]+y,bpOrg[2]+z],k=key(c);
+    bp.set(k,{c,t});
+    const l=new THREE.LineSegments(EG,new THREE.LineBasicMaterial({color:GCOL[t],transparent:true,opacity:.8}));
+    l.position.copy(toWorld(c));ghost.add(l);ghostMeshes.set(k,l);
+  });
+  updateBp();
+}
+function updateBp(){
+  if(!bpOn)return;let ok=0;
+  bp.forEach((v,k)=>{const d=types.get(k)===v.t;if(d)ok++;ghostMeshes.get(k).visible=!d});
+  info.textContent=ok===bp.size?'🚗 Mobil selesai! ('+ok+'/'+bp.size+')':'Mobil '+ok+'/'+bp.size+' — cubit di kotak garis';
+}
+function nearBp(g){
+  if(!bpOn)return null;let best=null,bd=1.8;
+  bp.forEach(v=>{if(types.get(key(v.c))===v.t)return;const d=Math.hypot(v.c[0]-g[0],v.c[1]-g[1],v.c[2]-g[2]);if(d<bd){bd=d;best=v.c}});
+  return best?best.slice():null;
+}
+function selType(t){
+  curType=t;document.querySelectorAll('#pal button').forEach(b=>b.classList.toggle('on',b.dataset.t===t));
+}
+document.querySelectorAll('#pal button').forEach(b=>b.onclick=()=>selType(b.dataset.t));
+$('guide').onclick=()=>{
+  bpOn=!bpOn;ghost.visible=bpOn;$('guide').classList.toggle('on',bpOn);
+  if(bpOn){
+    const f=new THREE.Vector3(0,0,-1).applyQuaternion(camera.quaternion).multiplyScalar(.6).add(camera.position);
+    const g=toGrid(f);bpOrg=[g[0]-1,g[1]-2,g[2]-3];
+    selType('auto');buildGhost();
+  } else {info.textContent='Cubit & tarik untuk membangun';selType('blok')}
+};
+
+/* ---------- Orientasi perangkat ---------- */
+let orient=null,hasOri=false,yaw=0,pitch=0;
+const q1=new THREE.Quaternion(-Math.SQRT1_2,0,0,Math.SQRT1_2),zz=new THREE.Vector3(0,0,1),eu=new THREE.Euler(),q0=new THREE.Quaternion();
+addEventListener('deviceorientation',e=>{if(e.alpha!=null){orient=e;hasOri=true}});
+const tq=new THREE.Quaternion();
+function updateCam(){
+  if(XR)return;
+  if(hasOri&&orient){
+    const r=Math.PI/180,a=(orient.alpha||0)*r,b=(orient.beta||0)*r,g=(orient.gamma||0)*r,
+          o=((screen.orientation&&screen.orientation.angle)||window.orientation||0)*r;
+    eu.set(b,a,-g,'YXZ');tq.setFromEuler(eu);tq.multiply(q1);
+    tq.multiply(q0.setFromAxisAngle(zz,-o));camera.quaternion.slerp(tq,1-Math.exp(-FDT/.045));
+  } else {camera.rotation.set(pitch,yaw,0,'YXZ')}
+}
+
+/* ---------- Proyeksi tangan -> dunia ---------- */
+function vidToScreen(nx,ny){ // object-fit: cover
+  const vw=(XR?dc.width:video.videoWidth)||W,vh=(XR?dc.height:video.videoHeight)||H,s=Math.max(W/vw,H/vh);
+  return [(nx*vw*s)-(vw*s-W)/2,(ny*vh*s)-(vh*s-H)/2];
+}
+const fpx=()=>XR?camera.projectionMatrix.elements[5]*H/2:(H/2)/Math.tan(FOV*Math.PI/360);
+function screenToWorld(sx,sy,d){
+  if(XR){const v=new THREE.Vector3(sx/W*2-1,-(sy/H)*2+1,.5);camera.projectionMatrixInverse.copy(camera.projectionMatrix).invert();v.applyMatrix4(camera.projectionMatrixInverse);v.multiplyScalar(d/Math.max(-v.z,1e-4));return v.applyMatrix4(camera.matrixWorld)}
+  const x=(sx-W/2)/fpx()*d,y=-(sy-H/2)/fpx()*d;
+  return new THREE.Vector3(x,y,-d).applyQuaternion(camera.quaternion).add(camera.position);
+}
+
+/* ---------- MediaPipe ---------- */
+class OE{constructor(mc,b){this.mc=mc;this.b=b;this.x=null;this.dx=0;this.t=0}
+  a(c,dt){const r=2*Math.PI*c*dt;return r/(r+1)}
+  f(v,t){if(this.x===null){this.x=v;this.t=t;return v}
+    const dt=Math.max((t-this.t)/1000,1e-3);this.t=t;
+    this.dx+=this.a(1,dt)*((v-this.x)/dt-this.dx);
+    this.x+=this.a(this.mc+this.b*Math.abs(this.dx),dt)*(v-this.x);return this.x}
+  reset(){this.x=null;this.dx=0}}
+const fX=new OE(.9,.025),fY=new OE(.9,.025),fS=new OE(.7,.04),fR=new OE(5,0),fD=new OE(.35,1.2);
+let pinched=false,lastRes=null,lost=0,hT=null,hS=null,pc=0;
+function onHands(res){
+  lastRes=res;const now=performance.now();
+  const lm=res.multiHandLandmarks&&res.multiHandLandmarks[0];
+  if(!lm){
+    if(++lost>8){if(pinched){pinched=false;endDraw()}hT=hS=null;[fX,fY,fS,fR,fD].forEach(f=>f.reset());pc=0}
+    return;
+  }
+  lost=0;
+  const vw=XR?dc.width:video.videoWidth,vh=XR?dc.height:video.videoHeight;
+  const P=i=>vidToScreen(lm[i].x,lm[i].y);
+  const sc=Math.hypot((lm[0].x-lm[9].x)*vw,(lm[0].y-lm[9].y)*vh);
+  const sPx=fS.f(sc*Math.max(W/vw,H/vh),now);
+  const t=P(4),i=P(8);
+  const r=fR.f(Math.hypot(t[0]-i[0],t[1]-i[1])/Math.max(sPx,1),now);
+  const want=pinched?r<.56:r<.33;
+  pc=want!==pinched?pc+1:0;
+  const on=pc>=(pinched?2:1)?want:pinched;
+  const x=fX.f((t[0]+i[0])/2,now),y=fY.f((t[1]+i[1])/2,now);
+  const d=fD.f(Math.min(1.3,Math.max(.25,fpx()*HAND_M/Math.max(sPx,1))),now);
+  let vx=0,vy=0;
+  if(hT){
+    const dts=Math.max((now-hT.t)/1000,.008);
+    vx=hT.vx*.4+((x-hT.x)/dts)*.6;vy=hT.vy*.4+((y-hT.y)/dts)*.6;
+    const sp=Math.hypot(vx,vy);
+    if(sp<18)vx=vy=0;else if(sp>2500){vx*=2500/sp;vy*=2500/sp}
+  }
+  hT={x,y,d,r,vx,vy,t:now};if(!hS)hS={x,y,d};
+  if(on&&!pinched){pinched=true;hS={x,y,d};beginDraw(screenToWorld(x,y,d))}
+  else if(!on&&pinched){pinched=false;endDraw()}
+}
+function stepHand(dt,now){
+  if(!hT||!hS)return;
+  const age=Math.min((now-hT.t)/1000,.07)+.02;          // tebak posisi antar deteksi
+  const tx=hT.x+hT.vx*age,ty=hT.y+hT.vy*age;
+  const dist=Math.hypot(tx-hS.x,ty-hS.y);
+  const k=1-Math.exp(-dt/(.11-.07*Math.min(dist/50,1))); // pelan = halus, cepat = responsif
+  hS.x+=(tx-hS.x)*k;hS.y+=(ty-hS.y)*k;
+  hS.d+=(hT.d-hS.d)*(1-Math.exp(-dt/.18));
+  if(pinched&&hT.r<.52)updateDraw(screenToWorld(hS.x,hS.y,hS.d));
+}
+
+/* ---------- Mouse/touch fallback ---------- */
+let mouseDown=false;
+function ptrWorld(e){return screenToWorld(e.clientX,e.clientY,.6)}
+glc.addEventListener('pointerdown',e=>{if(e.target!==glc)return;mouseDown=true;beginDraw(ptrWorld(e))});
+addEventListener('pointermove',e=>{if(mouseDown)updateDraw(ptrWorld(e))});
+addEventListener('pointerup',()=>{if(mouseDown){mouseDown=false;endDraw()}});
+addEventListener('keydown',e=>{
+  if(hasOri)return;const s=.06;
+  if(e.key==='ArrowLeft')yaw+=s;if(e.key==='ArrowRight')yaw-=s;
+  if(e.key==='ArrowUp')pitch+=s;if(e.key==='ArrowDown')pitch-=s;
+});
+
+/* ---------- HUD ---------- */
+const hl=[];let FDT=.016;
+const CONN=[[0,1],[1,2],[2,3],[3,4],[0,5],[5,6],[6,7],[7,8],[5,9],[9,10],[10,11],[11,12],[9,13],[13,14],[14,15],[15,16],[13,17],[17,18],[18,19],[19,20],[0,17]];
+function drawHud(){
+  hx.clearRect(0,0,W,H);
+  const lm=lastRes&&lastRes.multiHandLandmarks&&lastRes.multiHandLandmarks[0];
+  if(!lm){hl.length=0;return}
+  hx.strokeStyle='rgba(255,255,255,.55)';hx.lineWidth=1.5;
+  const kk=1-Math.exp(-FDT/.035);
+  const sl=lm.map((q,i)=>{const v=vidToScreen(q.x,q.y),h=hl[i]||(hl[i]=v.slice());h[0]+=(v[0]-h[0])*kk;h[1]+=(v[1]-h[1])*kk;return h});
+  const sc=Math.hypot(sl[0][0]-sl[9][0],sl[0][1]-sl[9][1]);
+  const cap=(ids,w)=>{
+    hx.lineCap=hx.lineJoin='round';
+    const path=()=>{hx.beginPath();ids.forEach((id,n)=>n?hx.lineTo(sl[id][0],sl[id][1]):hx.moveTo(sl[id][0],sl[id][1]))};
+    hx.globalCompositeOperation='source-over';
+    path();hx.lineWidth=w+3;hx.strokeStyle='rgba(235,242,255,.7)';hx.stroke();
+    hx.globalCompositeOperation='destination-out';
+    path();hx.lineWidth=w;hx.strokeStyle='#000';hx.stroke();
+    hx.globalCompositeOperation='source-over';
+    path();hx.lineWidth=w;hx.strokeStyle='rgba(225,235,255,.22)';hx.stroke();
+  };
+  cap([2,3,4],Math.min(46,Math.max(12,sc*.26)));
+  cap([5,6,7,8],Math.min(38,Math.max(10,sc*.21)));
+
+}
+
+/* ---------- Loop ---------- */
+function resize(){
+  W=innerWidth;H=innerHeight;
+  for(const c of [hud]){c.width=W;c.height=H}
+  if(!XR){renderer.setSize(W,H,false);camera.aspect=W/H;camera.updateProjectionMatrix()}
+}
+addEventListener('resize',resize);resize();
+const dc=document.createElement('canvas'),dctx=dc.getContext('2d');
+let hands,busy=false,lastVT=-1;
+let lastT=performance.now();
+function loop(now=performance.now()){
+  requestAnimationFrame(loop);
+  const dt=Math.min((now-lastT)/1000,.1);lastT=now;FDT=dt;
+  updateCam();stepHand(dt,now);animPrev(dt);stepPops(now);renderer.render(scene,camera);drawHud();
+  if(hands&&!busy&&video.readyState>=2&&video.currentTime!==lastVT){lastVT=video.currentTime;busy=true;
+    const w=480,h=Math.round(w*video.videoHeight/video.videoWidth)||270;
+    if(dc.width!==w||dc.height!==h){dc.width=w;dc.height=h}
+    dctx.drawImage(video,0,0,w,h);
+    hands.send({image:dc}).then(()=>busy=false).catch(()=>busy=false)}
+}
+
+$('go').onclick=async()=>{
+  try{
+    if(window.DeviceOrientationEvent&&DeviceOrientationEvent.requestPermission)await DeviceOrientationEvent.requestPermission();
+  }catch(e){}
+  try{
+    const st=await navigator.mediaDevices.getUserMedia({video:{facingMode:{ideal:'environment'},width:{ideal:960},height:{ideal:540},frameRate:{ideal:30}},audio:false});
+    video.srcObject=st;await video.play();
+  }catch(e){info.textContent='Kamera ditolak/tidak ada. Mode mouse aktif.'}
+  $('start').style.display='none';$('bar').style.display='flex';$('pal').style.display='flex';
+  info.textContent='Memuat hand-tracking…';
+  try{
+    hands=new Hands({locateFile:f=>`https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/${f}`});
+    hands.setOptions({maxNumHands:1,modelComplexity:/Mobi|Android|iPhone/i.test(navigator.userAgent)?0:1,minDetectionConfidence:.6,minTrackingConfidence:.5});
+    hands.onResults(r=>{if(info.textContent.startsWith('Memuat'))info.textContent='Cubit & tarik untuk membangun';onHands(r)});
+  }catch(e){info.textContent='Hand-tracking gagal dimuat. Pakai mouse.'}
+  loop();
+};
+
+/* ---------- WebXR 6DoF: bangunan menempel di ruang, kamera boleh berpindah ---------- */
+const VSS=`#version 300 es
+out vec2 uv;void main(){vec2 p=vec2(float(gl_VertexID&1),float(gl_VertexID>>1));uv=p;gl_Position=vec4(p*2.-1.,0,1);}`;
+const FSS=`#version 300 es
+precision mediump float;uniform sampler2D t;uniform float fy;in vec2 uv;out vec4 o;void main(){o=texture(t,vec2(uv.x,mix(uv.y,1.-uv.y,fy)));}`;
+let camProg=null,camFbo=null,camTex=null,camPix=null,camImg=null;const CW=320;
+function readCam(tex,cw,ch){
+  const gl=renderer.getContext(),h=Math.round(CW*ch/cw);
+  if(!camProg){
+    const mk=(t,src)=>{const x=gl.createShader(t);gl.shaderSource(x,src);gl.compileShader(x);return x};
+    camProg=gl.createProgram();gl.attachShader(camProg,mk(gl.VERTEX_SHADER,VSS));gl.attachShader(camProg,mk(gl.FRAGMENT_SHADER,FSS));gl.linkProgram(camProg);
+    camFbo=gl.createFramebuffer();camTex=gl.createTexture();
+  }
+  if(!camPix||dc.height!==h||dc.width!==CW){
+    dc.width=CW;dc.height=h;camPix=new Uint8Array(CW*h*4);camImg=new ImageData(CW,h);
+    gl.bindTexture(gl.TEXTURE_2D,camTex);gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA,CW,h,0,gl.RGBA,gl.UNSIGNED_BYTE,null);
+    gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,gl.LINEAR);gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MAG_FILTER,gl.LINEAR);
+  }
+  gl.bindFramebuffer(gl.FRAMEBUFFER,camFbo);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER,gl.COLOR_ATTACHMENT0,gl.TEXTURE_2D,camTex,0);
+  gl.viewport(0,0,CW,h);gl.disable(gl.DEPTH_TEST);gl.disable(gl.BLEND);gl.disable(gl.CULL_FACE);gl.disable(gl.SCISSOR_TEST);
+  gl.useProgram(camProg);gl.activeTexture(gl.TEXTURE0);gl.bindTexture(gl.TEXTURE_2D,tex);
+  gl.uniform1i(gl.getUniformLocation(camProg,'t'),0);gl.uniform1f(gl.getUniformLocation(camProg,'fy'),flipY);
+  gl.drawArrays(gl.TRIANGLE_STRIP,0,4);
+  gl.readPixels(0,0,CW,h,gl.RGBA,gl.UNSIGNED_BYTE,camPix);
+  gl.bindFramebuffer(gl.FRAMEBUFFER,xrSess.renderState.baseLayer.framebuffer);
+  renderer.state.reset();
+  const row=CW*4;for(let y=0;y<h;y++)camImg.data.set(camPix.subarray((h-1-y)*row,(h-y)*row),y*row);
+  dctx.putImageData(camImg,0,0);
+}
+function xrLoop(now,frame){
+  const dt=Math.min((now-lastT)/1000,.1);lastT=now;FDT=dt;
+  stepHand(dt,now);animPrev(dt);stepPops(now);renderer.render(scene,camera);drawHud();
+  if(frame&&hands&&!busy&&xrBind){
+    const pose=frame.getViewerPose(renderer.xr.getReferenceSpace()),v=pose&&pose.views[0];
+    if(v&&v.camera){
+      try{readCam(xrBind.getCameraImage(v.camera),v.camera.width,v.camera.height);busy=true;
+        hands.send({image:dc}).then(()=>busy=false).catch(()=>busy=false)}
+      catch(e){info.textContent='Akses kamera gagal: '+e.message}
+    }
+  }
+}
+$('flip').onclick=()=>{flipY^=1};
+['bar','pal'].forEach(id=>$(id).addEventListener('beforexrselect',e=>e.preventDefault()));
+$('goXR').onclick=async()=>{
+  try{
+    if(!navigator.xr||!(await navigator.xr.isSessionSupported('immersive-ar')))throw new Error('WebXR AR tidak didukung (pakai Chrome Android + Google Play Services for AR)');
+    const sess=await navigator.xr.requestSession('immersive-ar',{requiredFeatures:['local'],optionalFeatures:['camera-access','dom-overlay'],domOverlay:{root:document.body}});
+    xrSess=sess;XR=true;video.style.display='none';
+    renderer.xr.enabled=true;renderer.xr.setReferenceSpaceType('local');
+    await renderer.xr.setSession(sess);
+    try{xrBind=new XRWebGLBinding(sess,renderer.getContext())}catch(e){}
+    sess.addEventListener('end',()=>location.reload());
+    $('start').style.display='none';$('bar').style.display='flex';$('pal').style.display='flex';$('flip').style.display='block';
+    info.textContent=xrBind?'Memuat hand-tracking…':'Kamera tidak bisa dibaca di perangkat ini';
+    hands=new Hands({locateFile:f=>`https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/${f}`});
+    hands.setOptions({maxNumHands:1,modelComplexity:0,minDetectionConfidence:.6,minTrackingConfidence:.5});
+    hands.onResults(r=>{if(info.textContent.startsWith('Memuat'))info.textContent='Cubit & tarik; jalan mengelilingi bangunan';onHands(r)});
+    renderer.setAnimationLoop(xrLoop);
+  }catch(e){alert('AR 6DoF gagal: '+e.message)}
+};
+</script>
+</body>
+</html>
