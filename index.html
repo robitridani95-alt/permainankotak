@@ -1,0 +1,330 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Hand FX — Shield & Beam</title>
+<style>
+  *{box-sizing:border-box;margin:0;padding:0}
+  html,body{width:100%;height:100%;background:#000;overflow:hidden;font-family:ui-monospace,Menlo,Consolas,monospace;color:#d6d6d6}
+  #stage{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;background:#0d0e10}
+  canvas{width:100%;height:100%;object-fit:cover;display:block}
+  video{position:absolute;opacity:0;pointer-events:none;width:1px;height:1px}
+  #hud{position:fixed;top:calc(8px + env(safe-area-inset-top,0px));left:10px;font-size:11px;line-height:1.5;letter-spacing:.2px;color:#cfcfcf;text-shadow:0 1px 2px #000;z-index:5;white-space:pre}
+  #ctrl{position:fixed;left:0;right:0;bottom:calc(14px + env(safe-area-inset-bottom,0px));display:flex;gap:10px;justify-content:center;z-index:6}
+  #ctrl button{background:rgba(20,20,24,.65);color:#fff;border:1px solid rgba(255,255,255,.25);backdrop-filter:blur(6px);padding:10px 16px;border-radius:999px;font:inherit;font-size:12px;cursor:pointer}
+  #ctrl button.on{border-color:#ffc83d;color:#ffd96b;box-shadow:0 0 12px rgba(255,200,61,.35)}
+  #start{position:fixed;inset:0;z-index:10;background:#0d0e10;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:16px;text-align:center;padding:24px}
+  #start h1{font-size:22px;color:#fff;font-family:system-ui,sans-serif;letter-spacing:.3px}
+  #start p{font-size:13px;color:#9a9a9a;max-width:320px;line-height:1.6;font-family:system-ui,sans-serif}
+  #start button{background:linear-gradient(135deg,#ffb400,#ff7a00);color:#111;border:0;padding:14px 28px;border-radius:999px;font-weight:700;font-size:15px;cursor:pointer;box-shadow:0 0 24px rgba(255,160,0,.45)}
+  #msg{font-size:12px;color:#ff8a8a;min-height:16px}
+</style>
+</head>
+<body>
+<div id="stage"><canvas id="cv"></canvas></div>
+<video id="vid" playsinline muted></video>
+<div id="hud"></div>
+<div id="ctrl">
+  <button id="bS" class="on">Shield (s)</button>
+  <button id="bB" class="on">Beam (b)</button>
+  <button id="bQ">Quit (q)</button>
+</div>
+<div id="start">
+  <h1>Hand FX</h1>
+  <p>Buka telapak tangan → Shield emas muncul.<br>Angkat dua tangan → Beam neon menghubungkan jari.</p>
+  <button id="go">Mulai Kamera</button>
+  <div id="msg"></div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/hands.js" crossorigin="anonymous"></script>
+<script>
+(() => {
+  const cv = document.getElementById('cv'), ctx = cv.getContext('2d', { alpha: false, desynchronized: true });
+  const vid = document.getElementById('vid');
+  const hud = document.getElementById('hud');
+  const bS = document.getElementById('bS'), bB = document.getElementById('bB'), bQ = document.getElementById('bQ');
+  const startEl = document.getElementById('start'), msg = document.getElementById('msg');
+
+  let shieldOn = true, beamOn = true, running = false, stream = null, hands = null;
+  let tracks = [];             // {raw, cur, vis, seen, open, shield}
+  let pair = null, beamK = 0, lastT = performance.now();
+  let t0 = performance.now();
+
+  const CONN = [[0,1],[1,2],[2,3],[3,4],[0,5],[5,6],[6,7],[7,8],[5,9],[9,10],[10,11],[11,12],[9,13],[13,14],[14,15],[15,16],[13,17],[17,18],[18,19],[19,20],[0,17]];
+  const TIPS = [4, 8, 12, 16, 20];
+  const BEAM_COL = ['#19d3ff', '#ff3fd8', '#8f5bff', '#ff8a1f', '#ffd21f']; // cyan, pink, ungu, oranye, kuning
+  const GOLD = '#ffc83d';
+
+  function setHud() {
+    hud.textContent = 'q: quit\n(a)  Beam: ' + (beamOn ? 'ON' : 'OFF') + ' (b)  Shield: ' + (shieldOn ? 'ON' : 'OFF') + ' (s)';
+    bS.classList.toggle('on', shieldOn); bB.classList.toggle('on', beamOn);
+  }
+  setHud();
+
+  function resize() {
+    const dpr = Math.min(window.devicePixelRatio || 1, 1.5);
+    cv.width = innerWidth * dpr; cv.height = innerHeight * dpr;
+  }
+  addEventListener('resize', resize); resize();
+
+  // ---------- Map normalized landmarks → canvas (mirror + object-fit cover) ----------
+  function mapPt(lm) {
+    const vw = vid.videoWidth || 640, vh = vid.videoHeight || 480;
+    const cw = cv.width, ch = cv.height;
+    const s = Math.max(cw / vw, ch / vh);
+    const dw = vw * s, dh = vh * s;
+    const ox = (cw - dw) / 2, oy = (ch - dh) / 2;
+    return { x: ox + (1 - lm.x) * dw, y: oy + lm.y * dh };
+  }
+
+  // Deteksi hanya mengisi target (raw). Render jalan di 60fps dan menginterpolasi ke target.
+  function onResults(r) {
+    const now = performance.now();
+    const list = (r.multiHandLandmarks || []).map(h => h.map(mapPt));
+    const used = new Set();
+    list.forEach(h => {
+      let best = -1, bd = 1e9;
+      tracks.forEach((t, i) => { if (used.has(i)) return; const d = dist(t.raw[0], h[0]); if (d < bd) { bd = d; best = i; } });
+      if (best >= 0 && bd < cv.width * 0.4) {
+        const t = tracks[best]; used.add(best);
+        const dtS = Math.min(0.25, Math.max(0.008, (now - t.seen) / 1000));
+        const W = cv.width;
+        for (let i = 0; i < 21; i++) {
+          const f = t.f[i], p = h[i], o = t.raw[i];
+          const nx = oneEuro(f, 'x', p.x / W, dtS), ny = oneEuro(f, 'y', p.y / W, dtS);
+          o.x = nx * W; o.y = ny * W;
+          t.vel[i].x = f.dx * W; t.vel[i].y = f.dy * W;
+        }
+        t.seen = now;
+      } else {
+        const fl = h.map(p => ({ x: p.x / cv.width, y: p.y / cv.width, dx: 0, dy: 0 }));
+        tracks.push({ raw: h.map(p => ({ x: p.x, y: p.y })), f: fl, vel: h.map(() => ({ x: 0, y: 0 })), cur: h.map(p => ({ x: p.x, y: p.y })), vis: 0, seen: now, open: false, shield: 0 });
+        used.add(tracks.length - 1);
+      }
+    });
+  }
+
+  // One Euro Filter: diam saat tangan pelan (anti-jitter), nyaris tanpa lag saat tangan cepat.
+  const OE_MIN = 1.1, OE_BETA = 14, OE_D = 1.5;
+  const oeA = (cut, dt) => 1 / (1 + 1 / (6.283185 * cut) / dt);
+  function oneEuro(f, ax, v, dt) {
+    const d = 'd' + ax;
+    const dv = (v - f[ax]) / dt;
+    f[d] += oeA(OE_D, dt) * (dv - f[d]);
+    const cut = OE_MIN + OE_BETA * Math.abs(f[d]);
+    f[ax] += oeA(cut, dt) * (v - f[ax]);
+    return f[ax];
+  }
+
+  function update(dt, now) {
+    const W = cv.width;
+    tracks.forEach(t => {
+      const alive = now - t.seen < 140;
+      t.vis += ((alive ? 1 : 0) - t.vis) * (1 - Math.exp(-dt * (alive ? 16 : 8)));
+      // Target dibuat KONTINU: posisi terfilter + kecepatan × waktu sejak deteksi terakhir.
+      // Tidak ada lagi lompatan per-deteksi (30Hz) → gerak mulus di 60/120Hz.
+      const ahead = Math.min(0.09, (now - t.seen) / 1000 + 0.025);
+      const k = 1 - Math.exp(-dt * 28);
+      for (let i = 0; i < 21; i++) {
+        const c = t.cur[i], r = t.raw[i], v = t.vel[i];
+        c.x += (r.x + v.x * ahead - c.x) * k;
+        c.y += (r.y + v.y * ahead - c.y) * k;
+      }
+      // hysteresis telapak terbuka agar shield tidak berkedip
+      const w = t.raw[0];
+      const ratio = [[8,6],[12,10],[16,14],[20,18]].reduce((s, [a, b]) => s + (dist(t.raw[a], w) > dist(t.raw[b], w) * (t.open ? 1.0 : 1.12) ? 1 : 0), 0);
+      t.open = ratio >= 4;
+      const target = alive && t.open ? 1 : 0;
+      t.shield += (target - t.shield) * (1 - Math.exp(-dt * (target ? 9 : 12)));
+    });
+    tracks = tracks.filter(t => t.vis > 0.01 || now - t.seen < 140);
+  }
+
+  // ---------- Helpers ----------
+  const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
+  function isOpen(h) {
+    const w = h[0];
+    return [[8,6],[12,10],[16,14],[20,18]].filter(([t, p]) => dist(h[t], w) > dist(h[p], w) * 1.08).length >= 4;
+  }
+  function palmCenter(h) {
+    const idx = [0, 5, 9, 13, 17];
+    return { x: idx.reduce((s, i) => s + h[i].x, 0) / 5, y: idx.reduce((s, i) => s + h[i].y, 0) / 5 };
+  }
+
+  // ---------- Drawing ----------
+  function drawVideo() {
+    const vw = vid.videoWidth, vh = vid.videoHeight;
+    const cw = cv.width, ch = cv.height;
+    ctx.fillStyle = '#0d0e10'; ctx.fillRect(0, 0, cw, ch);
+    if (!vw) return;
+    const s = Math.max(cw / vw, ch / vh), dw = vw * s, dh = vh * s;
+    ctx.save();
+    ctx.translate(cw, 0); ctx.scale(-1, 1);
+    ctx.drawImage(vid, (cw - dw) / 2, (ch - dh) / 2, dw, dh);
+    ctx.restore();
+  }
+
+  function drawSkeleton(h, a = 1) {
+    const u = cv.width / 480;
+    ctx.save();
+    ctx.globalAlpha = a;
+    ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+    ctx.beginPath();
+    CONN.forEach(([a, b]) => { ctx.moveTo(h[a].x, h[a].y); ctx.lineTo(h[b].x, h[b].y); });
+    ctx.strokeStyle = 'rgba(255,190,40,.28)'; ctx.lineWidth = 6.5 * u; ctx.stroke();
+    ctx.strokeStyle = GOLD; ctx.lineWidth = 2.2 * u; ctx.stroke();
+    ctx.fillStyle = '#fff3c4';
+    ctx.beginPath();
+    h.forEach((p, i) => { const r = (TIPS.includes(i) ? 3.4 : 2.4) * u; ctx.moveTo(p.x + r, p.y); ctx.arc(p.x, p.y, r, 0, 6.283); });
+    ctx.fill();
+    ctx.restore();
+  }
+
+  function drawShield(h, time, s = 1) {
+    const e = s * s * (3 - 2 * s);
+    const c = palmCenter(h);
+    const R = dist(h[0], h[9]) * 0.95 * (0.55 + 0.45 * e);
+    const u = cv.width / 480;
+    const pulse = 1 + Math.sin(time * 4) * 0.04;
+    ctx.save();
+    ctx.translate(c.x, c.y);
+    ctx.globalCompositeOperation = 'lighter';
+    ctx.globalAlpha = e;
+
+    // glow fill
+    const g = ctx.createRadialGradient(0, 0, R * 0.1, 0, 0, R * 1.2 * pulse);
+    g.addColorStop(0, 'rgba(255,210,80,.55)');
+    g.addColorStop(.55, 'rgba(255,170,30,.22)');
+    g.addColorStop(1, 'rgba(255,140,0,0)');
+    ctx.fillStyle = g; ctx.beginPath(); ctx.arc(0, 0, R * 1.2 * pulse, 0, 6.283); ctx.fill();
+
+    ctx.strokeStyle = '#ffd24d';
+
+    // cincin luar solid
+    ctx.lineWidth = 2.6 * u; ctx.beginPath(); ctx.arc(0, 0, R * 1.05 * pulse, 0, 6.283); ctx.stroke();
+
+    // cincin putus-putus berputar (searah jarum jam)
+    ctx.save(); ctx.rotate(time * 1.1);
+    ctx.lineWidth = 4 * u; ctx.setLineDash([R * .35, R * .18]);
+    ctx.beginPath(); ctx.arc(0, 0, R * .88, 0, 6.283); ctx.stroke();
+    ctx.restore();
+
+    // cincin tipis berputar berlawanan + tick marks
+    ctx.save(); ctx.rotate(-time * 1.7);
+    ctx.lineWidth = 1.6 * u; ctx.setLineDash([]);
+    ctx.beginPath(); ctx.arc(0, 0, R * .7, 0, 6.283); ctx.stroke();
+    for (let i = 0; i < 36; i++) {
+      const a = i / 36 * 6.283, l = i % 3 === 0 ? .1 : .05;
+      ctx.beginPath(); ctx.moveTo(Math.cos(a) * R * .7, Math.sin(a) * R * .7);
+      ctx.lineTo(Math.cos(a) * R * (.7 + l), Math.sin(a) * R * (.7 + l)); ctx.stroke();
+    }
+    ctx.restore();
+
+    // heksagram tengah
+    ctx.save(); ctx.rotate(time * .6); ctx.lineWidth = 1.6 * u; ctx.setLineDash([]);
+    for (let k = 0; k < 2; k++) {
+      ctx.beginPath();
+      for (let i = 0; i < 3; i++) {
+        const a = i / 3 * 6.283 + k * Math.PI / 3 - Math.PI / 2;
+        const px = Math.cos(a) * R * .5, py = Math.sin(a) * R * .5;
+        i ? ctx.lineTo(px, py) : ctx.moveTo(px, py);
+      }
+      ctx.closePath(); ctx.stroke();
+    }
+    ctx.restore();
+
+    // inti
+    ctx.fillStyle = 'rgba(255,230,140,.9)';
+    ctx.beginPath(); ctx.arc(0, 0, R * .09 * pulse, 0, 6.283); ctx.fill();
+    ctx.restore();
+  }
+
+  function drawBeams(A, B, time, k = 1) {
+    const u = cv.width / 480;
+    ctx.save();
+    ctx.globalCompositeOperation = 'lighter';
+    ctx.lineCap = 'round';
+    TIPS.forEach((t, i) => {
+      const a = A[t], b = B[t], col = BEAM_COL[i];
+      // glow lebar
+      ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y);
+      ctx.strokeStyle = col;
+      ctx.globalAlpha = .14 * k; ctx.lineWidth = 15 * u; ctx.stroke();
+      ctx.globalAlpha = .3 * k; ctx.lineWidth = 7 * u; ctx.stroke();
+      // inti
+      ctx.globalAlpha = k; ctx.lineWidth = 2.4 * u; ctx.stroke();
+      // garis putih tipis di tengah
+      ctx.strokeStyle = 'rgba(255,255,255,.75)'; ctx.lineWidth = .9 * u; ctx.stroke();
+      // titik energi berjalan
+      const f = (time * .8 + i * .2) % 1;
+      const px = a.x + (b.x - a.x) * f, py = a.y + (b.y - a.y) * f;
+      ctx.fillStyle = col; ctx.globalAlpha = .4 * k;
+      ctx.beginPath(); ctx.arc(px, py, 7 * u, 0, 6.283); ctx.fill();
+      ctx.globalAlpha = k; ctx.fillStyle = '#fff';
+      ctx.beginPath(); ctx.arc(px, py, 3 * u, 0, 6.283); ctx.fill();
+      // ujung
+      [a, b].forEach(p => { ctx.fillStyle = col; ctx.beginPath(); ctx.arc(p.x, p.y, 4.5 * u, 0, 6.283); ctx.fill(); });
+    });
+    ctx.restore();
+  }
+
+  function frame() {
+    if (!running) return;
+    const now = performance.now();
+    const dt = Math.min(0.05, (now - lastT) / 1000); lastT = now;
+    const time = (now - t0) / 1000;
+    update(dt, now);
+    drawVideo();
+    const act = tracks.filter(t => now - t.seen < 140).sort((a, b) => a.cur[0].x - b.cur[0].x);
+    const two = beamOn && act.length >= 2;
+    if (two) pair = [act[0], act[1]];
+    beamK += ((two ? 1 : 0) - beamK) * (1 - Math.exp(-dt * 10));
+    tracks.forEach(t => drawSkeleton(t.cur, t.vis));
+    if (beamK > 0.01 && pair) drawBeams(pair[0].cur, pair[1].cur, time, beamK);
+    if (shieldOn) tracks.forEach(t => { const s = t.shield * (1 - beamK); if (s > 0.01) drawShield(t.cur, time, s); });
+    requestAnimationFrame(frame);
+  }
+
+  async function pump() {
+    if (!running) return;
+    if (vid.readyState >= 2) { try { await hands.send({ image: vid }); } catch (e) {} }
+    if (vid.requestVideoFrameCallback) vid.requestVideoFrameCallback(pump);
+    else requestAnimationFrame(pump);
+  }
+
+  async function start() {
+    msg.textContent = '';
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user', width: { ideal: 640 }, height: { ideal: 480 }, frameRate: { ideal: 30, max: 30 } }, audio: false });
+    } catch (e) { msg.textContent = 'Kamera tidak bisa diakses: ' + e.message + ' (butuh HTTPS/localhost)'; return; }
+    vid.srcObject = stream; await vid.play();
+    hands = new Hands({ locateFile: f => 'https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/' + f });
+    hands.setOptions({ maxNumHands: 2, modelComplexity: 0, minDetectionConfidence: .55, minTrackingConfidence: .5 });
+    hands.onResults(onResults);
+    startEl.style.display = 'none';
+    running = true; t0 = lastT = performance.now();
+    requestAnimationFrame(frame); pump();
+  }
+
+  function quit() {
+    running = false;
+    if (stream) stream.getTracks().forEach(t => t.stop());
+    stream = null; tracks = []; pair = null; beamK = 0;
+    startEl.style.display = 'flex';
+  }
+
+  document.getElementById('go').onclick = start;
+  bS.onclick = () => { shieldOn = !shieldOn; setHud(); };
+  bB.onclick = () => { beamOn = !beamOn; setHud(); };
+  bQ.onclick = quit;
+  addEventListener('keydown', e => {
+    const k = e.key.toLowerCase();
+    if (k === 's') { shieldOn = !shieldOn; setHud(); }
+    else if (k === 'b') { beamOn = !beamOn; setHud(); }
+    else if (k === 'q') quit();
+  });
+})();
+</script>
+</body>
+</html>
