@@ -131,7 +131,7 @@ const pool=[];let prevKey='',headM=null;
 const pv={on:false,ax:0,dir:1,n:0,disp:0,origin:[0,0,0],incl:false};
 function animPrev(dt){
   if(!pv.on||!drawing)return;
-  pv.disp+=(pv.n-pv.disp)*(1-Math.exp(-dt/.09));
+  pv.disp+=(pv.n-pv.disp)*(1-Math.exp(-dt/.045));
   if(Math.abs(pv.n-pv.disp)<.003)pv.disp=pv.n;
   const L=pv.disp,N=Math.ceil(L-1e-3);
   prev.clear();
@@ -211,7 +211,7 @@ function chainDraw(p){
   segs=[];curSeg=out;
   if(ax>=0&&(!pv.on||pv.ax!==ax||pv.dir!==dir))pv.disp=0;
   pv.on=true;if(ax>=0){pv.ax=ax;pv.dir=dir}
-  pv.n=n;pv.origin=origin.slice();pv.incl=incl;
+  pv.n=ax>=0?Math.min(a[ax]/CELL,30):0;pv.origin=origin.slice();pv.incl=incl;
 }
 function updateDraw(p){
   if(!drawing)return;
@@ -318,7 +318,7 @@ class OE{constructor(mc,b){this.mc=mc;this.b=b;this.x=null;this.dx=0;this.t=0}
     this.dx+=this.a(1,dt)*((v-this.x)/dt-this.dx);
     this.x+=this.a(this.mc+this.b*Math.abs(this.dx),dt)*(v-this.x);return this.x}
   reset(){this.x=null;this.dx=0}}
-const fX=new OE(.9,.025),fY=new OE(.9,.025),fS=new OE(.7,.04),fR=new OE(5,0),fD=new OE(.35,1.2);
+const fX=new OE(1.4,.04),fY=new OE(1.4,.04),fS=new OE(.9,.05),fR=new OE(5,0),fD=new OE(.6,1.6),fM=new OE(.8,.05);
 let pinched=false,lastRes=null,lost=0,hT=null,hS=null,pc=0;
 function onHands(res){
   lastRes=res;const now=performance.now();
@@ -338,7 +338,10 @@ function onHands(res){
   pc=want!==pinched?pc+1:0;
   const on=pc>=(pinched?2:1)?want:pinched;
   const x=fX.f((t[0]+i[0])/2,now),y=fY.f((t[1]+i[1])/2,now);
-  const d=fD.f(Math.min(1.3,Math.max(.25,fpx()*HAND_M/Math.max(sPx,1))),now);
+  const wl=res.multiHandWorldLandmarks&&res.multiHandWorldLandmarks[0];
+  let hm=HAND_M;if(wl){const pm=Math.hypot(wl[0].x-wl[9].x,wl[0].y-wl[9].y);if(pm>.03)hm=pm}
+  hm=fM.f(hm,now);
+  const d=fD.f(Math.min(1.3,Math.max(.2,fpx()*hm/Math.max(sPx,1))),now);
   let vx=0,vy=0;
   if(hT){
     const dts=Math.max((now-hT.t)/1000,.008);
@@ -355,9 +358,9 @@ function stepHand(dt,now){
   const age=Math.min((now-hT.t)/1000,.07)+.02;          // tebak posisi antar deteksi
   const tx=hT.x+hT.vx*age,ty=hT.y+hT.vy*age;
   const dist=Math.hypot(tx-hS.x,ty-hS.y);
-  const k=1-Math.exp(-dt/(.11-.07*Math.min(dist/50,1))); // pelan = halus, cepat = responsif
+  const k=1-Math.exp(-dt/(.075-.05*Math.min(dist/45,1))); // pelan = halus, cepat = responsif
   hS.x+=(tx-hS.x)*k;hS.y+=(ty-hS.y)*k;
-  hS.d+=(hT.d-hS.d)*(1-Math.exp(-dt/.18));
+  hS.d+=(hT.d-hS.d)*(1-Math.exp(-dt/.11));
   if(pinched&&hT.r<.52)updateDraw(screenToWorld(hS.x,hS.y,hS.d));
 }
 
