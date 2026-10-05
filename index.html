@@ -1,0 +1,101 @@
+<!DOCTYPE html><html lang="id"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no"><title>AR Cube Builder</title>
+<style>
+html,body{margin:0;height:100%;background:#000;overflow:hidden;font-family:system-ui,sans-serif;color:#fff}
+video,canvas{position:fixed;inset:0;width:100%;height:100%}
+video{object-fit:cover}
+canvas{touch-action:none}
+.bar{position:fixed;left:0;right:0;bottom:14px;display:flex;gap:8px;justify-content:center;z-index:3}
+button{background:#0008;color:#fff;border:1px solid #fff4;border-radius:999px;padding:10px 16px;font-size:14px;backdrop-filter:blur(6px)}
+#ring{position:fixed;width:34px;height:34px;margin:-17px 0 0 -17px;border-radius:50%;border:2px solid #fff9;background:#fff2;pointer-events:none;display:none;z-index:2}
+#info{position:fixed;top:12px;left:12px;font-size:13px;opacity:.85;z-index:3;text-shadow:0 1px 3px #000}
+#start{position:fixed;inset:0;z-index:5;background:#000d;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;text-align:center;padding:24px}
+#start button{background:#2b3dff;border:0;font-size:17px;padding:14px 28px}
+</style></head><body>
+<video id="v" playsinline muted></video><canvas id="c"></canvas><div id="ring"></div><div id="info"></div>
+<div class="bar"><button id="undo">Urungkan</button><button id="clr">Hapus</button><button id="flip">Balik Kamera</button></div>
+<div id="start"><h2>AR Cube Builder</h2><p>Cubit (jempol + telunjuk), tarik untuk memanjangkan balok, lepas untuk mengunci.<br>Seret layar untuk memutar sudut pandang.</p><button id="go">Mulai Kamera</button><small id="err"></small></div>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/hands.js"></script>
+<script>
+const S=.08,T=S*.06,$=id=>document.getElementById(id);
+const v=$('v'),cv=$('c'),ring=$('ring'),info=$('info');
+const R=new THREE.WebGLRenderer({canvas:cv,alpha:true,antialias:true});R.setPixelRatio(Math.min(devicePixelRatio,2));
+const sc=new THREE.Scene(),cam=new THREE.PerspectiveCamera(60,1,.01,20);
+sc.add(new THREE.AmbientLight(0xffffff,.8));const dl=new THREE.DirectionalLight(0xffffff,.55);dl.position.set(.4,1,.6);sc.add(dl);
+function resize(){R.setSize(innerWidth,innerHeight,false);cam.aspect=innerWidth/innerHeight;cam.updateProjectionMatrix()}
+addEventListener('resize',resize);resize();
+
+// orbit kamera
+let yaw=0,pitch=.15,dist=.6,drag=null;
+function placeCam(){cam.position.set(Math.sin(yaw)*Math.cos(pitch),Math.sin(pitch),Math.cos(yaw)*Math.cos(pitch)).multiplyScalar(dist);cam.lookAt(0,0,0);cam.updateMatrixWorld()}
+cv.onpointerdown=e=>{drag=[e.clientX,e.clientY]};
+addEventListener('pointermove',e=>{if(!drag)return;yaw-=(e.clientX-drag[0])*.006;pitch=Math.max(-1.4,Math.min(1.4,pitch+(e.clientY-drag[1])*.006));drag=[e.clientX,e.clientY]});
+addEventListener('pointerup',()=>drag=null);
+
+// kubus permanen (instanced): wajah abu-biru + rusuk biru tebal
+const MAX=900,box=new THREE.BoxGeometry(1,1,1);
+const faces=new THREE.InstancedMesh(box,new THREE.MeshLambertMaterial({color:0xb4c0dc}),MAX);
+const bars=new THREE.InstancedMesh(box,new THREE.MeshBasicMaterial({color:0x2e3cff}),MAX*12);
+faces.count=bars.count=0;faces.frustumCulled=bars.frustumCulled=false;sc.add(faces,bars);
+function edges(c,h,fn){for(let a=0;a<3;a++){const b=(a+1)%3,d=(a+2)%3;for(const sb of[-1,1])for(const sd of[-1,1]){const p=[...c],s=[T,T,T];p[b]+=sb*h[b];p[d]+=sd*h[d];s[a]=2*h[a]+T;fn(p,s)}}}
+const cells=new Map(),undo=[],D=new THREE.Object3D();
+function rebuild(){let i=0,j=0;
+ for(const k of cells.keys()){const c=k.split(',').map(n=>n*S);
+  D.position.set(...c);D.scale.setScalar(S*.999);D.updateMatrix();faces.setMatrixAt(i++,D.matrix);
+  edges(c,[S/2,S/2,S/2],(p,s)=>{D.position.set(...p);D.scale.set(...s);D.updateMatrix();bars.setMatrixAt(j++,D.matrix)})}
+ faces.count=i;bars.count=j;faces.instanceMatrix.needsUpdate=bars.instanceMatrix.needsUpdate=true;info.textContent=i+' kubus'}
+
+// pratinjau: balok biru tembus pandang + kubus hantu
+const pv=new THREE.Group();sc.add(pv);pv.visible=false;
+const pfill=new THREE.Mesh(box,new THREE.MeshBasicMaterial({color:0x1b2cff,transparent:true,opacity:.7,depthWrite:false}));
+const pbars=Array.from({length:12},()=>new THREE.Mesh(box,new THREE.MeshBasicMaterial({color:0x3d5aff})));
+pv.add(pfill,...pbars);
+function showBox(lo,hi,solid){const c=[],h=[];for(let i=0;i<3;i++){c[i]=(lo[i]+hi[i])/2*S;h[i]=(hi[i]-lo[i]+1)*S/2}
+ pfill.position.set(...c);pfill.scale.set(h[0]*2,h[1]*2,h[2]*2);pfill.material.opacity=solid?.7:.12;
+ let n=0;edges(c,h,(p,s)=>{const m=pbars[n++];m.position.set(...p);m.scale.set(...s)});pv.visible=true}
+
+// tangan
+let L=null,mirror=false,pinch=false,was=false,lost=0,sm=null,anchor=null,seg=null;
+function scr(p){const vw=v.videoWidth,vh=v.videoHeight,k=Math.max(innerWidth/vw,innerHeight/vh),x=mirror?1-p.x:p.x;
+ return[x*vw*k-(vw*k-innerWidth)/2,p.y*vh*k-(vh*k-innerHeight)/2]}
+function commit(){if(seg){const add=[];for(let x=seg.lo[0];x<=seg.hi[0];x++)for(let y=seg.lo[1];y<=seg.hi[1];y++)for(let z=seg.lo[2];z<=seg.hi[2];z++){const k=x+','+y+','+z;if(!cells.has(k)&&cells.size<MAX){cells.set(k,1);add.push(k)}}
+ if(add.length)undo.push(add);rebuild()}seg=null;anchor=null}
+function endPinch(){if(was)commit();was=pinch=false;anchor=null;seg=null}
+function handle(){
+ if(!L){if(++lost>6){endPinch();pv.visible=false;ring.style.display='none';sm=null}return}
+ lost=0;
+ const[tx,ty]=scr(L[4]),[ix,iy]=scr(L[8]),[wx,wy]=scr(L[0]),[mx,my]=scr(L[9]);
+ const px=(tx+ix)/2,py=(ty+iy)/2,hs=Math.hypot(mx-wx,my-wy)||1,pd=Math.hypot(tx-ix,ty-iy)/hs;
+ if(pd<.32)pinch=true;else if(pd>.5)pinch=false;
+ const Z=Math.max(.25,Math.min(1.4,.09*.866/(hs/innerHeight)));
+ const dir=new THREE.Vector3(px/innerWidth*2-1,-(py/innerHeight*2-1),.5).unproject(cam).sub(cam.position).normalize();
+ const P=cam.position.clone().addScaledVector(dir,Z);sm=sm?sm.lerp(P,.4):P;
+ const cell=sm.toArray().map(x=>Math.round(x/S));
+ if(pinch&&!was)anchor=cell;
+ if(!pinch&&was)commit();
+ was=pinch;
+ if(pinch&&anchor){const d=cell.map((c,i)=>c-anchor[i]);let a=0;for(let i=1;i<3;i++)if(Math.abs(d[i])>Math.abs(d[a]))a=i;
+  const e=[...anchor];e[a]+=d[a];seg={lo:anchor.map((c,i)=>Math.min(c,e[i])),hi:anchor.map((c,i)=>Math.max(c,e[i]))};showBox(seg.lo,seg.hi,true)}
+ else{seg=null;showBox(cell,cell,false)}
+ ring.style.display='block';ring.style.left=px+'px';ring.style.top=py+'px';ring.style.transform='scale('+(pinch?.6:1)+')'}
+
+const hands=new Hands({locateFile:f=>'https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/'+f});
+hands.setOptions({maxNumHands:1,modelComplexity:1,minDetectionConfidence:.6,minTrackingConfidence:.5});
+hands.onResults(r=>{L=(r.multiHandLandmarks&&r.multiHandLandmarks[0])||null;handle()});
+
+let facing='environment';
+async function startCam(){if(v.srcObject)v.srcObject.getTracks().forEach(t=>t.stop());
+ const s=await navigator.mediaDevices.getUserMedia({video:{facingMode:{ideal:facing},width:{ideal:1280},height:{ideal:720}},audio:false});
+ const f=s.getVideoTracks()[0].getSettings().facingMode;
+ mirror=f?f==='user':!/Android|iPhone|iPad/i.test(navigator.userAgent);
+ v.style.transform=mirror?'scaleX(-1)':'';v.srcObject=s;await v.play()}
+async function detect(){for(;;){if(v.readyState>=2&&v.videoWidth)await hands.send({image:v});else await new Promise(r=>setTimeout(r,50))}}
+function draw(){placeCam();R.render(sc,cam);requestAnimationFrame(draw)}
+
+function undoLast(){const a=undo.pop();if(a){a.forEach(k=>cells.delete(k));rebuild()}}
+$('undo').onclick=undoLast;$('clr').onclick=()=>{cells.clear();undo.length=0;rebuild()};
+$('flip').onclick=()=>{facing=facing==='user'?'environment':'user';startCam()};
+addEventListener('keydown',e=>{if(e.key==='z')undoLast()});
+$('go').onclick=async()=>{try{await startCam();$('start').style.display='none';detect()}catch(e){$('err').textContent='Kamera gagal: '+e.message+' (buka lewat https atau localhost)'}};
+rebuild();draw();
+</script></body></html>
